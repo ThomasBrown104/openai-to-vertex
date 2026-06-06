@@ -44,6 +44,9 @@ export function transformChatResponse(response: GenerateContentResponse, model: 
         if (choice.message.tool_calls.length > 0 && !textContent) {
             choice.message.content = null
         }
+        // Override finish_reason to 'tool_calls' when function calls are present
+        // This is critical - OpenAI clients expect this to know the model wants tool results
+        choice.finish_reason = 'tool_calls'
     }
 
     return {
@@ -92,7 +95,8 @@ export function transformStreamChunk(
     const choice: ChatChunkChoice = {
         index: 0,
         delta,
-        finish_reason: finishReason
+        // Override finish_reason to 'tool_calls' when function calls are present
+        finish_reason: functionCalls && functionCalls.length > 0 ? 'tool_calls' : finishReason
     }
 
     const chunk: ChatCompletionChunk = {

@@ -16,12 +16,14 @@ interface TransformedChatRequest {
  * Key mappings:
  *  - system messages → config.systemInstruction
  *  - user / assistant messages → contents[]
+ *  - tool messages (function results) → functionResponse parts
+ *  - assistant tool_calls → functionCall parts
  *  - temperature, max_tokens, top_p, stop → config fields
  *  - tools / tool_choice → config.tools / config.toolConfig
  */
 export function transformChatRequest(body: ChatCompletionRequest): TransformedChatRequest {
     const systemParts: { text: string }[] = []
-    const contents: { role: string; parts: { text: string }[] }[] = []
+    const contents: { role: string; parts: unknown[] }[] = []
 
     for (const msg of body.messages) {
         if (msg.role === 'system') {
@@ -31,16 +33,84 @@ export function transformChatRequest(body: ChatCompletionRequest): TransformedCh
             continue
         }
 
-        const role = msg.role === 'assistant' ? 'model' : 'user'
+        // Handle tool result messages → Google functionResponse
+        if (msg.role === 'tool') {
+            const functionName = msg.name ?? 'unknown'
+            let responsePayload: unknown
+            try {
+                responsePayload = JSON.parse(msg.content ?? '{}')
+            } catch {
+                responsePayload = { result: msg.content ?? '' }
+            }
+
+            // Tool results are sent as 'user' role with functionResponse parts
+            const functionResponsePart = {
+                functionResponse: {
+                    name: functionName,
+                    response: responsePayload
+                }
+            }
+
+            // Merge with previous user message or create new one
+            const last = contents[contents.length - 1]
+            if (last && last.role === 'user') {
+                last.parts.push(functionResponsePart)
+            } else {
+                contents.push({ role: 'user', parts: [functionResponsePart] })
+            }
+            continue
+        }
+
+        // Handle assistant messages
+        if (msg.role === 'assistant') {
+            const parts: unknown[] = []
+
+            // Add text content if present
+            const text = extractTextContent(msg)
+            if (text) {
+                parts.push({ text })
+            }
+
+            // Add functionCall parts if tool_calls present
+            if (msg.tool_calls && msg.tool_calls.length > 0) {
+                for (const toolCall of msg.tool_calls) {
+                    let args: unknown
+                    try {
+                        args = JSON.parse(toolCall.function.arguments)
+                    } catch {
+                        args = {}
+                    }
+                    parts.push({
+                        functionCall: {
+                            name: toolCall.function.name,
+                            args
+                        }
+                    })
+                }
+            }
+
+            if (parts.length === 0) continue
+
+            // Assistant maps to 'model' role in Google
+            const last = contents[contents.length - 1]
+            if (last && last.role === 'model') {
+                last.parts.push(...parts)
+            } else {
+                contents.push({ role: 'model', parts })
+            }
+            continue
+        }
+
+        // Handle user messages
         const text = extractTextContent(msg)
         if (!text) continue
 
         // Merge consecutive messages from the same role (Google requires alternating roles)
         const last = contents[contents.length - 1]
-        if (last && last.role === role) {
+        if (last && last.role === 'user') {
             last.parts.push({ text })
         } else {
-            contents.push({ role, parts: [{ text }] })
+            contents.push({ role: 'user', parts: [{ text }] })
         }
     }
 
