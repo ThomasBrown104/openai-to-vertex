@@ -77,6 +77,8 @@ export function transformChatRequest(body: ChatCompletionRequest): TransformedCh
                     name: tool.function.name,
                     description: tool.function.description ?? '',
                     parameters: tool.function.parameters
+                        ? (sanitizeSchemaForVertex(tool.function.parameters) as Record<string, unknown>)
+                        : undefined
                 }
             ]
         }))
@@ -126,6 +128,88 @@ export function transformEmbeddingRequest(body: EmbeddingRequest): TransformedEm
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Sanitize a JSON Schema object for Google Vertex AI / Gemini.
+ * Vertex AI does not support several JSON Schema keywords that OpenAI tools may include:
+ *  - patternProperties
+ *  - const
+ *  - $ref / $defs / definitions  (internal references)
+ *  - additionalProperties with complex schemas
+ *  - unevaluatedProperties
+ *  - if / then / else (conditional schemas)
+ *  - dependentSchemas / dependentRequired
+ *  - propertyNames
+ *  - minProperties / maxProperties (on object schemas)
+ *
+ * We recursively walk the schema and strip unsupported keys so the API accepts it.
+ */
+function sanitizeSchemaForVertex(schema: unknown): unknown {
+    if (schema == null || typeof schema !== 'object') return schema
+
+    if (Array.isArray(schema)) return schema.map(sanitizeSchemaForVertex)
+
+    const input = schema as Record<string, unknown>
+    const output: Record<string, unknown> = {}
+
+    // Keys to skip entirely (not supported by Vertex AI)
+    const SKIP_KEYS = new Set([
+        'patternProperties',
+        'const',
+        '$ref',
+        '$defs',
+        'definitions',
+        'unevaluatedProperties',
+        'if',
+        'then',
+        'else',
+        'dependentSchemas',
+        'dependentRequired',
+        'propertyNames'
+    ])
+
+    for (const [key, value] of Object.entries(input)) {
+        if (SKIP_KEYS.has(key)) continue
+
+        // Recurse into nested schemas
+        if (key === 'properties' && typeof value === 'object' && value !== null) {
+            const sanitized: Record<string, unknown> = {}
+            for (const [propKey, propVal] of Object.entries(value as Record<string, unknown>)) {
+                sanitized[propKey] = sanitizeSchemaForVertex(propVal)
+            }
+            output[key] = sanitized
+        } else if (key === 'items' || key === 'additionalProperties') {
+            if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+                // Only keep additionalProperties if it's a simple boolean or a simple schema
+                output[key] = sanitizeSchemaForVertex(value)
+            } else {
+                output[key] = value
+            }
+        } else if (key === 'anyOf' || key === 'oneOf' || key === 'allOf') {
+            if (Array.isArray(value)) {
+                output[key] = value.map(sanitizeSchemaForVertex)
+            }
+        } else if (key === 'not') {
+            output[key] = sanitizeSchemaForVertex(value)
+        } else {
+            output[key] = sanitizeSchemaDeep(value)
+        }
+    }
+
+    return output
+}
+
+function sanitizeSchemaDeep(value: unknown): unknown {
+    if (value == null || typeof value !== 'object') return value
+    if (Array.isArray(value)) return value.map(sanitizeSchemaDeep)
+    // For plain objects, recurse
+    const obj = value as Record<string, unknown>
+    const result: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(obj)) {
+        result[k] = sanitizeSchemaForVertex(v)
+    }
+    return result
+}
 
 function extractTextContent(msg: ChatMessage): string {
     if (typeof msg.content === 'string') return msg.content
